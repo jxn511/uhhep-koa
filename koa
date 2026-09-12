@@ -1,0 +1,375 @@
+#!/usr/bin/env bash
+#
+# koa -- drive Koa (UH Manoa HPC, Slurm) from your laptop, one command at a time.
+#
+# WHY THIS EXISTS. Koa authentication is interactive (publickey AND Duo), and a
+# script -- or an assistant -- driving it runs ONE command per invocation with
+# no terminal to answer a Duo prompt. SSH connection multiplexing resolves
+# that: `koa up` authenticates ONCE and leaves a control socket; every later
+# subcommand rides it non-interactively. Without the socket each call would
+# hang on a prompt nobody can answer.
+#
+# WHAT IT DELIBERATELY DOES NOT DO. It never handles a password, never writes a
+# credential, and never runs compute on the login node. `step` and `batch` are
+# the only ways it reaches an actual compute resource, and both refuse to
+# silently fall back to the gateway -- a job that quietly runs on the login
+# node looks identical to a working one until it is killed for CPU abuse.
+#
+#   koa up                    authenticate once (interactive; you answer Duo)
+#   koa status                is the socket alive, and what is queued
+#   koa down                  close the sockets
+#
+#   koa run  <cmd...>         run on the GATEWAY (git, squeue, ls -- cheap only)
+#   koa step <cmd...>         run inside YOUR CURRENT ALLOCATION (real Koa)
+#   koa batch <sbatch-args>   submit a job
+#   koa queues                partition occupancy, and the scheduler's own
+#                             start estimates for your pending jobs
+#   koa watch <jobid>         poll until the job leaves the queue
+#   koa tail  <jobid>         show the job's output file (~/logs)
+#
+#   koa push <path> [dest]    tar + ship + VERIFY sha256 (Lustre-friendly)
+#   koa stage                 what is already staged on Koa, and free space
+#   koa restore-test <file> [tarball]
+#                             pull one file back out of a pushed tarball and
+#                             diff it -- prove recovery, do not assume it
+#   koa verify                prove the bridge reaches a COMPUTE node
+#
+# Configuration: the block at the top of this script, ~/.config/koa/config,
+# and koa.conf.example in the repository.
+# A recipe for transferring data from KEK to Koa lives in the README.
+#
+# Exit codes follow the project convention: 0 ok, 1 degraded/refused, 2 cannot
+# run (no socket, no allocation).
+set -uo pipefail
+
+# --- configuration ---------------------------------------------------------
+# Every value below is overridable in two ways: by an environment variable of
+# the same name, and by an optional config file ~/.config/koa/config -- a
+# plain KEY=value file (shell syntax, sourced if it exists; set KOA_CONFIG to
+# point somewhere else).
+#
+# Precedence is environment > config file > default. The environment values are
+# captured BEFORE the file is sourced, because sourcing would otherwise clobber
+# an explicit `KOA_PART_GPU=gpu-sandbox koa batch ...` on the command line.
+_env_KOA_USER="${KOA_USER-}"
+_env_KOA_HOST="${KOA_HOST-}"
+_env_KOA_DTN="${KOA_DTN-}"
+_env_KOA_PART_CPU="${KOA_PART_CPU-}"
+_env_KOA_PART_GPU="${KOA_PART_GPU-}"
+_env_KOA_SCRATCH="${KOA_SCRATCH-}"
+
+KOA_CONFIG="${KOA_CONFIG:-$HOME/.config/koa/config}"
+# shellcheck source=/dev/null
+[ -r "$KOA_CONFIG" ] && . "$KOA_CONFIG"
+
+# $USER itself can be unset in a non-login environment (cron, a container), and
+# `set -u` would abort on it, so id(1) is the last resort.
+KOA_USER="${_env_KOA_USER:-${KOA_USER:-${USER:-$(id -un)}}}"
+# KOA_HOST may be a real hostname or an ssh config alias. The author's own
+# ~/.ssh/config defined `Host koa` for koa.its.hawaii.edu (and `koa-dtn` for
+# the data transfer node); either form works here, because every ssh
+# invocation passes the user explicitly as $KOA_USER@$KOA_HOST.
+KOA_HOST="${_env_KOA_HOST:-${KOA_HOST:-koa.its.hawaii.edu}}"
+KOA_DTN="${_env_KOA_DTN:-${KOA_DTN:-koa-dtn.its.hawaii.edu}}"
+# MEASURED on the cluster, correcting the guesses this block used to carry:
+#   partitions          shared (3d, default) / shared-long (7d) / sandbox (4h)
+#                       gpu (3d) / gpu-sandbox (4h) / kill-* (preemptible)
+#                       There is NO 'koa' or 'koa-gpu' partition.
+#   scratch             ~/koa_scratch is normally a symlink to
+#                       /mnt/lustre/koa/scratch/$USER
+#   group store         /mnt/lustre/koa/lab/<your_group>
+#   modules             a FULL tree exists (lang/Python, CUDA, NVHPC,
+#                       tools/Singularity/latest); load what you need inside
+#                       the job, not on the login node.
+#   noexec              /home AND /mnt/lustre are mounted noexec ON THE LOGIN
+#                       NODE: nothing user-installed executes there. Whether
+#                       compute nodes relax this decides venv-on-scratch vs
+#                       Singularity; test it in your first allocation.
+KOA_PART_CPU="${_env_KOA_PART_CPU:-${KOA_PART_CPU:-shared}}"
+KOA_PART_GPU="${_env_KOA_PART_GPU:-${KOA_PART_GPU:-gpu}}"
+KOA_SCRATCH="${_env_KOA_SCRATCH:-${KOA_SCRATCH:-/mnt/lustre/koa/scratch/$KOA_USER}}"
+unset _env_KOA_USER _env_KOA_HOST _env_KOA_DTN \
+      _env_KOA_PART_CPU _env_KOA_PART_GPU _env_KOA_SCRATCH
+
+# Derived, not configured: where `push` lands by default, and what `stage`
+# reports on.
+STAGE_DIR="$KOA_SCRATCH/incoming"
+# Must outlast a working session; `koa up` is the one interactive moment.
+CONTROL_PERSIST=8h
+
+die()  { echo "koa: $*" >&2; exit 2; }
+warn() { echo "koa: $*" >&2; }
+
+# Where the control socket for a host lives. Honour an ssh config that already
+# sets ControlPath (the author's did: ~/.ssh/cm-koa, ~/.ssh/cm-koa-dtn), and
+# otherwise use that same scheme under ~/.ssh/, named from the host so the two
+# sockets never collide.
+ctl_path() {
+    local host="$1" sock
+    sock=$(ssh -G "$KOA_USER@$host" 2>/dev/null | awk '/^controlpath /{print $2; exit}')
+    sock="${sock/#\~/$HOME}"
+    if [ -z "$sock" ] || [ "$sock" = "none" ]; then
+        sock="$HOME/.ssh/cm-${host//[^A-Za-z0-9._-]/_}"
+    fi
+    printf '%s\n' "$sock"
+}
+
+# Every remote call goes through these two, so the socket path and the explicit
+# user are stated in exactly one place.
+kssh() {
+    local host="$1"; shift
+    ssh -o ControlPath="$(ctl_path "$host")" "$KOA_USER@$host" "$@"
+}
+kctl() {   # kctl <host> <check|exit>
+    ssh -o ControlPath="$(ctl_path "$1")" -O "$2" "$KOA_USER@$1" >/dev/null 2>&1
+}
+
+# The socket is the whole mechanism, so every subcommand that needs it says so
+# rather than hanging on a password prompt that cannot be answered.
+need_socket() {
+    # Takes the host to test (default: the login host). The two sockets live
+    # and die independently -- the login one died under a Windows DNS
+    # switchover once while the DTN one survived -- so a subcommand must gate
+    # on the socket it actually uses, not on the login socket as a proxy for
+    # "authenticated".
+    local host="${1:-$KOA_HOST}" sock
+    sock=$(ctl_path "$host")
+    # A ControlPath carrying % tokens is expanded by ssh, not by us, so it
+    # cannot be stat'ed from here; `ssh -O check` is the authority either way.
+    case "$sock" in
+        *%*) : ;;
+        *) [ -S "$sock" ] || die "no control socket for $host. Run:  koa up" ;;
+    esac
+    kctl "$host" check || die "socket for $host is stale. Run:  koa up"
+}
+
+# Find the caller's running allocation. Refuses on ambiguity rather than
+# guessing which job to run inside -- dispatching a step into the wrong
+# allocation is worse than stopping.
+current_jobid() {
+    local ids n
+    ids=$(kssh "$KOA_HOST" 'squeue -u $USER -h -t RUNNING -o %i' 2>/dev/null | tr -d '\r')
+    n=$(printf '%s\n' "$ids" | grep -c '[0-9]')
+    [ "$n" -eq 0 ] && die "no RUNNING allocation. Start one in your terminal:
+    salloc -p $KOA_PART_GPU --gres=gpu:1 -c 8 --mem=64G -t 4:00:00"
+    [ "$n" -gt 1 ] && die "several running jobs -- pass one explicitly:
+$(printf '%s\n' "$ids" | sed 's/^/    /')
+    koa step --jobid=<id> <cmd>"
+    printf '%s\n' "$ids" | grep -m1 '[0-9]'
+}
+
+cmd="${1:-}"; shift 2>/dev/null || true
+
+case "$cmd" in
+up)
+    # Interactive on purpose: this is the one moment a human answers Duo.
+    # ControlMaster/ControlPersist are passed explicitly rather than assumed
+    # from ~/.ssh/config, so this works for someone with no Koa stanza there.
+    echo "koa: opening master connection (answer any prompt)..."
+    ssh -o ControlPath="$(ctl_path "$KOA_HOST")" -o ControlMaster=auto \
+        -o ControlPersist="$CONTROL_PERSIST" -fN "$KOA_USER@$KOA_HOST" \
+        || die "authentication failed"
+    ssh -o ControlPath="$(ctl_path "$KOA_DTN")" -o ControlMaster=auto \
+        -o ControlPersist="$CONTROL_PERSIST" -fN "$KOA_USER@$KOA_DTN" \
+        || warn "gateway is up but the DTN is not; push will prompt"
+    kctl "$KOA_HOST" check && echo "koa: socket established, ~$CONTROL_PERSIST"
+    ;;
+
+down)
+    kctl "$KOA_HOST" exit; kctl "$KOA_DTN" exit
+    echo "koa: sockets closed"
+    ;;
+
+status)
+    if kctl "$KOA_HOST" check; then echo "socket : UP"
+    else echo "socket : DOWN  (run: koa up)"; exit 1; fi
+    echo "gateway: $(kssh "$KOA_HOST" hostname 2>/dev/null)"
+    echo "--- your queue ---"
+    kssh "$KOA_HOST" 'squeue -u $USER -o "%.10i %.9P %.20j %.2t %.10M %.6D %R"' 2>/dev/null
+    ;;
+
+queues)
+    # Occupancy and scheduling expectation for the Koa partitions. sinfo
+    # aggregates to one row per partition when the format omits the state
+    # field; %F is nodes A/I/O/T, %C is CPUs A/I/O/T. GPU slots come from
+    # GresUsed (per node, total vs allocated), and the honest "when will I
+    # run" is the SCHEDULER'S own estimate (squeue --start), never a guess
+    # from queue depth.
+    need_socket
+    PARTS="sandbox,shared,shared-long,gpu,gpu-sandbox,kill-shared"
+    kssh "$KOA_HOST" '
+      echo "== partition occupancy   (A/I/O/T = allocated/idle/other/total) =="
+      printf "%-14s %-12s %-16s %-20s\n" PARTITION TIMELIMIT "NODES A/I/O/T" "CPUS A/I/O/T"
+      sinfo -h -p '"$PARTS"' -o "%14P %12l %16F %20C"
+      echo
+      echo "== GPU slots, per node   (used / total) =="
+      sinfo -h -N -p gpu,gpu-sandbox -O "NodeList:14,StateCompact:8,Gres:32,GresUsed:40" | sort -u
+      echo
+      echo "== pending pressure, by partition =="
+      pd=$(squeue -h -p '"$PARTS"' -t PD -o "%P" | sort | uniq -c)
+      if [ -n "$pd" ]; then echo "$pd"; else echo "  (no pending jobs in these partitions)"; fi
+      echo
+      echo "== your pending jobs: the scheduler own start estimates =="
+      st=$(squeue -h -u $USER -t PD --start -o "%.10i %.11P %.20j %.20S %R")
+      if [ -n "$st" ]; then echo "$st"; else echo "  (none pending)"; fi
+      echo
+      echo "reading it: idle (I) nodes in your partition + shallow pending"
+      echo "  -> seconds to minutes. Deep pending with reason Priority or"
+      echo "  Resources -> you wait for backfill; the start estimate above is"
+      echo "  the scheduler committing itself, and N/A means it will not."
+      echo "  sandbox/gpu-sandbox (4h) are the low-contention doors."
+    '
+    ;;
+
+run)
+    need_socket
+    [ $# -gt 0 ] || die "usage: koa run <cmd...>"
+    kssh "$KOA_HOST" "$*"
+    ;;
+
+step)
+    need_socket
+    local_jobid=""
+    case "${1:-}" in --jobid=*) local_jobid="${1#--jobid=}"; shift;; esac
+    [ -n "$local_jobid" ] || local_jobid="$(current_jobid)" || exit 2
+    [ $# -gt 0 ] || die "usage: koa step [--jobid=N] <cmd...>"
+    # --overlap: newer SLURM refuses to share allocated resources with an
+    # existing step without it, which is precisely what we are doing.
+    kssh "$KOA_HOST" "srun --jobid=$local_jobid --overlap bash -lc '$*'"
+    ;;
+
+batch)
+    need_socket
+    [ $# -gt 0 ] || die "usage: koa batch <sbatch-args...> --wrap='...'
+  remember -p $KOA_PART_CPU (cpu) or -p $KOA_PART_GPU (gpu)"
+    # ~/logs is created before submit so that the output lands somewhere that
+    # exists -- sbatch inherits this ssh session's working directory, which is
+    # your home -- and so `koa tail` knows where to look. Unless the caller
+    # names an output file, the job writes ~/logs/<jobname>-<jobid>.out (and
+    # stderr into it), which is exactly the pattern `koa tail` reads.
+    outopt="-o logs/%x-%j.out"
+    for a in "$@"; do
+        case "$a" in -o|-o*|--output|--output=*) outopt="";; esac
+    done
+    kssh "$KOA_HOST" "mkdir -p ~/logs && sbatch $outopt $*"
+    ;;
+
+watch)
+    need_socket
+    id="${1:?usage: koa watch <jobid>}"
+    echo "koa: polling job $id"
+    while kssh "$KOA_HOST" "squeue -h -j $id -o %T" 2>/dev/null | grep -q .; do sleep 30; done
+    kssh "$KOA_HOST" "sacct -j $id --format=JobID,State,Elapsed,MaxRSS,ExitCode -n" 2>/dev/null
+    ;;
+
+tail)
+    need_socket
+    id="${1:?usage: koa tail <jobid>}"
+    kssh "$KOA_HOST" "tail -40 ~/logs/*-$id.out 2>/dev/null || ls ~/logs"
+    ;;
+
+push)
+    # Tar-then-ship, because scratch is LUSTRE and Lustre is poor at
+    # many-small-file transfer: each file costs a metadata round trip. One
+    # stream of one big file is dramatically faster than 260k small ones.
+    need_socket "$KOA_DTN"
+    src="${1:?usage: koa push <local path> [remote dir]}"
+    [ -e "$src" ] || die "no such path: $src"
+    dest="${2:-$STAGE_DIR}"
+    base=$(basename "${src%/}")
+    tarball="/tmp/${base}.tar.gz"
+    echo "koa: packing $src ..."
+    tar czf "$tarball" -C "$(dirname "${src%/}")" "$base" || die "tar failed"
+    sum=$(sha256sum "$tarball" | awk '{print $1}')
+    echo "koa: $(du -h "$tarball" | cut -f1), sha256 ${sum:0:12}"
+    kssh "$KOA_DTN" "mkdir -p $dest"
+    rsync -a --info=progress2 \
+        -e "ssh -o ControlPath=$(ctl_path "$KOA_DTN")" \
+        "$tarball" "$KOA_USER@$KOA_DTN:$dest/" || die "transfer failed"
+    # Verify the FAR END, not the transfer's own exit code: a truncated file
+    # can still exit 0. Verify via the DTN -- the same node the bytes landed
+    # on, one filesystem with the login host -- so push needs only ONE live
+    # socket. Verifying via the login host would need both, and a shipment
+    # once stalled on exactly that when the login socket died under a DNS
+    # switchover while the DTN socket survived.
+    far=$(kssh "$KOA_DTN" "sha256sum $dest/$(basename "$tarball") 2>/dev/null | awk '{print \$1}'")
+    if [ "$sum" = "$far" ]; then
+        echo "koa: VERIFIED $dest/$(basename "$tarball")"
+        rm -f "$tarball"
+    else
+        die "sha256 MISMATCH -- local $sum, remote ${far:-<none>}; tarball kept at $tarball"
+    fi
+    ;;
+
+stage)
+    # What is already up there. Run this BEFORE re-uploading anything.
+    need_socket
+    kssh "$KOA_HOST" "ls -lh $STAGE_DIR 2>/dev/null || echo 'stage dir not present: $STAGE_DIR'"
+    kssh "$KOA_HOST" "df -h $KOA_SCRATCH 2>/dev/null | tail -1"
+    ;;
+
+restore-test)
+    # A copy nobody has restored from is a hypothesis. Pull one file back out
+    # of a tarball `koa push` shipped and diff it against the local original --
+    # cheap, and it exercises the whole path (permissions, tar integrity,
+    # transfer) rather than trusting that a successful upload implies a
+    # successful download.
+    need_socket
+    src="${1:-}"
+    [ -n "$src" ] && [ -f "$src" ] || die "usage: koa restore-test <local file> [remote tarball]
+  the file must be one that lives inside a directory you pushed"
+    # `push <dir>` stores members as <basename dir>/..., so by default look for
+    # the tarball named after this file's own parent directory.
+    parent=$(basename "$(dirname "$(readlink -f "$src")")")
+    tarball="${2:-$STAGE_DIR/$parent.tar.gz}"
+    member="$parent/$(basename "$src")"
+    echo "koa: restore-test $member  <-  $tarball"
+    tmp=$(mktemp -d)
+    # Extract JUST the one member, remotely, then bring it back.
+    if ! kssh "$KOA_HOST" "tar xzf $tarball -O '$member' 2>/dev/null" > "$tmp/restored" 2>/dev/null \
+       || [ ! -s "$tmp/restored" ]; then
+        rm -rf "$tmp"
+        die "could not extract '$member' from $tarball -- run: koa push $(dirname "$src")"
+    fi
+    if cmp -s "$src" "$tmp/restored"; then
+        echo "koa: RESTORE VERIFIED -- $(wc -c < "$tmp/restored") bytes, byte-identical"
+        rm -rf "$tmp"
+    else
+        echo "koa: RESTORE MISMATCH -- local and restored differ" >&2
+        echo "  local    : $(sha256sum "$src" | cut -c1-16)" >&2
+        echo "  restored : $(sha256sum "$tmp/restored" | cut -c1-16)" >&2
+        echo "  kept at  : $tmp/restored" >&2
+        exit 1
+    fi
+    ;;
+
+verify)
+    need_socket
+    g=$(kssh "$KOA_HOST" 'hostname; echo "jobid=[$SLURM_JOB_ID]"' 2>/dev/null | tr '\n' ' ')
+    echo "gateway : $g"
+    id="$(current_jobid)" || exit 2
+    c=$(kssh "$KOA_HOST" "srun --jobid=$id --overlap bash -lc 'hostname; echo jobid=[\$SLURM_JOB_ID]'" 2>/dev/null | tr '\n' ' ')
+    echo "compute : $c"
+    # The check that matters: two DIFFERENT hostnames. Identical ones mean the
+    # step silently ran on the login node, which looks like success until the
+    # job is killed for CPU abuse.
+    gh=${g%% *}; ch=${c%% *}
+    if [ -n "$ch" ] && [ "$gh" != "$ch" ]; then
+        echo "koa: BRIDGE OK -- steps reach a compute node"
+    else
+        echo "koa: BRIDGE SUSPECT -- gateway and 'compute' are the same host" >&2
+        exit 1
+    fi
+    ;;
+
+*)
+    # The usage text IS the header comment, printed out of the file itself.
+    # The range used to end at a hardcoded line number, and each time a
+    # subcommand was added the usage silently stopped listing it -- a help
+    # text that lies by omission. Anchor on the marker instead, so the next
+    # addition cannot reintroduce this.
+    end=$(grep -n '^# Exit codes follow' "${BASH_SOURCE[0]}" | cut -d: -f1)
+    sed -n "3,$((end - 2))p" "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

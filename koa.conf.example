@@ -1,0 +1,40 @@
+# koa.conf.example -- copy to ~/.config/koa/config and edit.
+#
+# The `koa` script sources this file if it exists. It is plain KEY=value shell
+# syntax: no export needed, no spaces around the '=', quote anything with a
+# space in it. Anything you leave commented out keeps the default shown.
+#
+# Precedence is environment > this file > default, so a one-off override still
+# works on the command line:
+#
+#     KOA_PART_CPU=sandbox koa batch -t 30 --wrap='hostname'
+#
+# Set KOA_CONFIG in the environment to read a different file than
+# ~/.config/koa/config.
+
+# Your Koa username. Default: $USER on this machine.
+#KOA_USER=jdoe
+
+# The login/gateway host. May be a real hostname or an ssh config alias (the
+# script passes the user explicitly, so an alias with no User line is fine).
+# Default: koa.its.hawaii.edu
+#KOA_HOST=koa.its.hawaii.edu
+
+# The data transfer node. `koa push` ships through this one, never the login
+# node. Default: koa-dtn.its.hawaii.edu
+#KOA_DTN=koa-dtn.its.hawaii.edu
+
+# Default CPU partition, quoted in the `koa batch` usage reminder.
+# Koa has shared (3d, default), shared-long (7d), sandbox (4h), kill-* .
+# Default: shared
+#KOA_PART_CPU=shared
+
+# Default GPU partition, quoted in the `koa batch` reminder and in the salloc
+# hint `koa step` prints when you have no allocation. Koa has gpu (3d) and
+# gpu-sandbox (4h). Default: gpu
+#KOA_PART_GPU=gpu
+
+# Your Lustre scratch directory. `koa stage` reports free space here and
+# `koa push` lands in $KOA_SCRATCH/incoming by default.
+# Default: /mnt/lustre/koa/scratch/$KOA_USER
+#KOA_SCRATCH=/mnt/lustre/koa/scratch/jdoe

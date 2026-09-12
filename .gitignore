@@ -1,0 +1,5 @@
+# local configuration and editor debris; the config template is koa.conf.example
+config
+*.sock
+*~
+.DS_Store
