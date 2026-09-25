@@ -202,7 +202,8 @@ q)
     # full. The user is the session's own (KOA_USER, the ssh login) unless one
     # is named, so a colleague's queue is `koa q <user>`.
     need_socket
-    u="${2:-$KOA_USER}"; valid_user "$u"
+    # the subcommand was shifted away above: an optional user name is $1
+    u="${1:-$KOA_USER}"; valid_user "$u"
     kssh "$KOA_HOST" "squeue -u $u -o '%.10i %.22j %.2t %.10M %.5C %.8m %R'" 2>/dev/null
     ;;
 
@@ -213,7 +214,8 @@ job)
     #   koa job <jobid>            your own session's user
     #   koa job <user> <jobid>     a colleague's job
     need_socket
-    if [ -n "${3-}" ]; then u="$2"; jid="$3"; else u="$KOA_USER"; jid="${2-}"; fi
+    # the subcommand was shifted away above: `job <jobid>` or `job <user> <jobid>`
+    if [ -n "${2-}" ]; then u="$1"; jid="$2"; else u="$KOA_USER"; jid="${1-}"; fi
     valid_user "$u"
     case "$jid" in ''|*[!0-9_]*) die "usage: koa job [user] <jobid>  (a numeric Slurm job id)";; esac
     kssh "$KOA_HOST" "scontrol show job $jid; echo '--- live (sstat; running jobs, your own only) ---'; sstat -j $jid --format=JobID,AveCPU,MaxRSS,MaxVMSize,NTasks 2>/dev/null; echo '--- record (sacct) ---'; sacct -u $u -j $jid --format=JobID,JobName%22,AllocCPUS,ReqMem,MaxRSS,Elapsed,State,ExitCode" 2>/dev/null
