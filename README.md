@@ -468,6 +468,10 @@ Host koa-dtn
 ```
 koa up                    authenticate once (interactive; you answer Duo); opens the sockets
 koa status                is the socket alive, and what is queued
+koa q [user]              the queue with cores and memory per job (squeue's default
+                          format hides both); the session's user unless one is named
+koa job [user] <jobid>    one job in full: scontrol, live sstat, the sacct record --
+                          the Slurm counterpart of LSF's bjobs -l
 koa down                  close the sockets
 
 koa run   <cmd...>        run on the LOGIN node (git, squeue, ls: cheap things only)
@@ -505,6 +509,8 @@ koa run squeue -u $USER                  # rides the socket, no prompt
 koa queues                               # where is room right now
 koa batch -p sandbox -t 0:10:00 -J hello --wrap 'hostname; module load data/ROOT/6.30.06-foss-2022b; root -b -q'
 koa watch 1234567
+koa q                                    # your jobs with their cores and memory
+koa job 1234567                          # everything Slurm knows about one job
 koa tail 1234567                         # ~/logs/hello-1234567.out
 koa batch myfit.slurm                    # a script file works the same way
 koa down

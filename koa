@@ -17,6 +17,10 @@
 #
 #   koa up                    authenticate once (interactive; you answer Duo)
 #   koa status                is the socket alive, and what is queued
+#   koa q [user]              the queue with CORES and MEMORY per job; the user
+#                             is the session's own unless one is named
+#   koa job [user] <jobid>    one job in full (scontrol + sstat + sacct), the
+#                             Slurm counterpart of LSF's bjobs -l
 #   koa down                  close the sockets
 #
 #   koa run  <cmd...>         run on the GATEWAY (git, squeue, ls -- cheap only)
@@ -98,6 +102,9 @@ STAGE_DIR="$KOA_SCRATCH/incoming"
 CONTROL_PERSIST=8h
 
 die()  { echo "koa: $*" >&2; exit 2; }
+# A user name is a POSIX account name (letters, digits, . _ -); anything else is
+# refused before it can reach the remote shell.
+valid_user() { case "$1" in ''|*[!A-Za-z0-9._-]*) die "not a user name: '$1'";; esac; }
 warn() { echo "koa: $*" >&2; }
 
 # Where the control socket for a host lives. Honour an ssh config that already
@@ -186,6 +193,30 @@ status)
     echo "gateway: $(kssh "$KOA_HOST" hostname 2>/dev/null)"
     echo "--- your queue ---"
     kssh "$KOA_HOST" 'squeue -u $USER -o "%.10i %.9P %.20j %.2t %.10M %.6D %R"' 2>/dev/null
+    ;;
+
+q)
+    # The queue with what a capacity decision needs: allocated cores (%C) and
+    # memory (%m) per job. squeue's default format prints neither, so a single
+    # 20-worker srun reads as "one job" and the node looks idle when it is
+    # full. The user is the session's own (KOA_USER, the ssh login) unless one
+    # is named, so a colleague's queue is `koa q <user>`.
+    need_socket
+    u="${2:-$KOA_USER}"; valid_user "$u"
+    kssh "$KOA_HOST" "squeue -u $u -o '%.10i %.22j %.2t %.10M %.5C %.8m %R'" 2>/dev/null
+    ;;
+
+job)
+    # One job in full, the Slurm counterpart of LSF's bjobs -l: scontrol for
+    # the attributes, sstat for live use (only while it runs, only your own),
+    # sacct for the record (works after the job has ended). Forms:
+    #   koa job <jobid>            your own session's user
+    #   koa job <user> <jobid>     a colleague's job
+    need_socket
+    if [ -n "${3-}" ]; then u="$2"; jid="$3"; else u="$KOA_USER"; jid="${2-}"; fi
+    valid_user "$u"
+    case "$jid" in ''|*[!0-9_]*) die "usage: koa job [user] <jobid>  (a numeric Slurm job id)";; esac
+    kssh "$KOA_HOST" "scontrol show job $jid; echo '--- live (sstat; running jobs, your own only) ---'; sstat -j $jid --format=JobID,AveCPU,MaxRSS,MaxVMSize,NTasks 2>/dev/null; echo '--- record (sacct) ---'; sacct -u $u -j $jid --format=JobID,JobName%22,AllocCPUS,ReqMem,MaxRSS,Elapsed,State,ExitCode" 2>/dev/null
     ;;
 
 queues)
