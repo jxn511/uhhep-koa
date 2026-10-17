@@ -30,6 +30,10 @@
 #                             start estimates for your pending jobs
 #   koa watch <jobid>         poll until the job leaves the queue
 #   koa tail  <jobid>         show the job's output file (~/logs)
+#   koa kill  <jobid>[,..] [--name <JobName>] [--state <STATE>] [--signal <SIG>] [--apply]
+#                             cancel YOUR jobs: lists the matches and stops (a dry
+#                             run) unless --apply; a whole array by its base id,
+#                             one task as <id>_<task>; never another user's job
 #
 #   koa push <path> [dest]    tar + ship + VERIFY sha256 (Lustre-friendly)
 #   koa stage                 what is already staged on Koa, and free space
@@ -299,6 +303,70 @@ tail)
     need_socket
     id="${1:?usage: koa tail <jobid>}"
     kssh "$KOA_HOST" "tail -40 ~/logs/*-$id.out 2>/dev/null || ls ~/logs"
+    ;;
+
+kill)
+    # Cancel the caller's OWN jobs, and only after showing them. A cancel is
+    # irreversible, so this is a dry run by default and acts only under --apply.
+    # Targets: job ids as Slurm spells them (123 = the whole array, 123_4 = one
+    # task; comma- or space-separated) and/or --name <JobName>, narrowed by
+    # --state <STATE>; --signal <SIG> sends that signal instead of ending the
+    # job. Every squeue and scancel here carries -u $KOA_USER: another user's
+    # job is never matched, whatever id is typed (there is deliberately no
+    # [user] form, unlike `q` and `job`). Argument errors are decided before the
+    # socket is needed.
+    apply=0; name=""; state=""; sig=""; ids=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --apply)   apply=1;;
+            --name)    name="${2-}"; [ -n "$name" ] || die "kill: --name needs a job name"; shift;;
+            --name=*)  name="${1#--name=}";;
+            --state)   state="${2-}"; [ -n "$state" ] || die "kill: --state needs PENDING, RUNNING, ..."; shift;;
+            --state=*) state="${1#--state=}";;
+            --signal)  sig="${2-}"; [ -n "$sig" ] || die "kill: --signal needs a signal name or number"; shift;;
+            --signal=*) sig="${1#--signal=}";;
+            -h|--help) die "usage: koa kill <jobid>[,<jobid>...] [--name <JobName>] [--state <STATE>] [--signal <SIG>] [--apply]";;
+            -*)        die "kill: unknown option $1";;
+            *)  IFS=',' read -ra more <<< "$1"
+                for t in "${more[@]}"; do
+                    case "$t" in ''|*[!0-9_]*|_*|*_) die "kill: '$t' is not a Slurm job id (123 or 123_4)";; esac
+                    ids+=("$t")
+                done;;
+        esac
+        shift
+    done
+    [ ${#ids[@]} -gt 0 ] || [ -n "$name" ] || die "usage: koa kill <jobid>[,<jobid>...] [--name <JobName>] [--state <STATE>] [--signal <SIG>] [--apply]"
+    case "$name" in *[!A-Za-z0-9_.+-]*) die "kill: --name '$name' has characters a Slurm job name does not";; esac
+    case "$state" in *[!A-Za-z,_]*) die "kill: --state '$state' is not a Slurm state";; esac
+    case "$sig" in *[!A-Za-z0-9]*) die "kill: --signal '$sig' is not a signal";; esac
+    need_socket
+    # what would go, shown first
+    idlist=""; [ ${#ids[@]} -gt 0 ] && idlist=$(IFS=,; printf '%s' "${ids[*]}")
+    sel="squeue -u $KOA_USER -h -o '%.12i %.22j %.2t %.10M %.5C %.8m %R'"
+    [ -n "$name" ]   && sel="$sel --name=$name"
+    [ -n "$state" ]  && sel="$sel -t $state"
+    [ -n "$idlist" ] && sel="$sel -j $idlist"
+    listing=$(kssh "$KOA_HOST" "$sel" 2>/dev/null | tr -d '\r' | grep '[0-9]')
+    if [ -z "$listing" ]; then
+        echo "koa: kill: no job of yours matches${idlist:+ $idlist}${name:+ --name $name}${state:+ --state $state} (already gone, or not yours)"
+        exit 1
+    fi
+    printf '%s\n' "$listing"
+    n=$(printf '%s\n' "$listing" | grep -c '[0-9]')
+    if [ "$apply" -ne 1 ]; then
+        echo "koa: kill: DRY RUN -- $n job line(s) above would be cancelled; add --apply to do it"
+        exit 0
+    fi
+    sc="scancel -v -u $KOA_USER"
+    [ -n "$name" ]  && sc="$sc --name=$name"
+    [ -n "$state" ] && sc="$sc -t $state"
+    [ -n "$sig" ]   && sc="$sc --signal=$sig"
+    kssh "$KOA_HOST" "$sc ${ids[*]-}" 2>&1 | tr -d '\r' | sed 's/^/koa: /'
+    sleep 2
+    left=$(kssh "$KOA_HOST" "$sel" 2>/dev/null | tr -d '\r' | grep -c '[0-9]')
+    if [ -n "$sig" ]; then echo "koa: kill: signal $sig sent to $n job line(s); $left still listed (expected: a signal does not end the job)"; exit 0; fi
+    if [ "$left" -eq 0 ]; then echo "koa: kill: cancelled $n job line(s); none left in the queue"; exit 0; fi
+    echo "koa: kill: $left of $n job line(s) still listed after scancel (completing, or scancel refused above)"; exit 1
     ;;
 
 push)

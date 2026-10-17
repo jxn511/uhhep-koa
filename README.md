@@ -484,6 +484,10 @@ koa queues                partition occupancy, GPU slots per node, pending press
                           and the scheduler's own start estimate for your pending jobs
 koa watch <jobid>         poll until the job leaves the queue, then its sacct line
 koa tail  <jobid>         last 40 lines of ~/logs/*-<jobid>.out
+koa kill  <jobid>[,<jobid>...] [--name <JobName>] [--state <STATE>] [--signal <SIG>] [--apply]
+                          cancel YOUR jobs: lists the matching queue entries and stops
+                          there (a dry run) unless --apply; a whole array by its base id,
+                          one task as <id>_<task>; never another user's job
 
 koa push <path> [dest]    tar + ship via the DTN + verify sha256 on the far end;
                           default dest $KOA_SCRATCH/incoming
@@ -493,6 +497,16 @@ koa restore-test <file> [tarball]
                           against the local original: prove a copy is recoverable
 koa verify                prove the bridge reaches a COMPUTE node, not just the gateway
 ```
+
+`koa kill` is deliberately two-step. Without `--apply` it only prints the
+entries of your own queue that the id list and the `--name` / `--state`
+filters select (the filters are ANDed), so you see what would go before it
+goes; with `--apply` it runs `scancel -v` on exactly that selection and lists
+the queue again two seconds later. It exits 0 when nothing is left (or a
+signal was sent with `--signal`), 1 when entries remain or nothing matched,
+2 for an argument error or no socket. Every `squeue` and `scancel` it issues
+carries `-u $KOA_USER`, so a colleague's job cannot be cancelled by a mistyped
+id; cancelling someone else's job is not a thing this tool does.
 
 The control sockets live under `~/.ssh/`: if your ssh config sets a
 `ControlPath` for the host, that one is used; otherwise
@@ -512,6 +526,8 @@ koa watch 1234567
 koa q                                    # your jobs with their cores and memory
 koa job 1234567                          # everything Slurm knows about one job
 koa tail 1234567                         # ~/logs/hello-1234567.out
+koa kill 1234567                         # shows the job; nothing happens yet
+koa kill 1234567 --apply                 # now it is cancelled
 koa batch myfit.slurm                    # a script file works the same way
 koa down
 ```
