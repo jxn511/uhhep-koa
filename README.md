@@ -492,7 +492,12 @@ koa jobstats [user] [--since 7d|<YYYY-MM-DD>] [--name <JobName>] [--family] [--n
                           human-readable job statistics, past and current: per job the
                           cores, elapsed, CPU efficiency, memory requested vs peak, with
                           the wasteful shapes flagged; --family folds them per job-name
-                          family; running jobs live from sstat
+                          family with the median wait and the preempted count; running
+                          jobs live from sstat
+koa route <cpus> <mem> [<run minutes>] [--resumable [<cell minutes>]]
+                          where to submit a job of this shape now: the scheduler's start
+                          estimate on belle2, shared and kill-shared, the measured kill-queue
+                          preemption rate, the expected completion per route and a verdict
 
 koa push <path> [dest]    tar + ship via the DTN + verify sha256 on the far end;
                           default dest $KOA_SCRATCH/incoming
@@ -527,7 +532,24 @@ tokens that carry a digit removed, so `fit_chunk2`, `fit_v2` and
 `fit_prompt16_offres` fold to `fit`), with CPU-hours allocated and used per
 family -- the same figures, by family, that the weekly efficiency mail
 reports for the account. Running jobs are listed live from `sstat` (CPU time
-and peak so far). `koa jobstats <user>` reads a colleague's, as `q` does.
+and peak so far). `koa jobstats <user>` reads a colleague's, as `q` does. The
+family table also carries the median submit-to-start wait (`WAIT-p50`) and the
+count of preempted or requeued incarnations (`PREEMPT`, from the duplicate
+records), and the footer states the kill-queue preemption rate: preempted
+incarnations per running hour on `kill-*`, the quantity `koa route` needs.
+
+`koa route` answers "where do I submit this now" for a job of a given shape
+(cores and memory) under a simple rule: the group's own partition `belle2`
+first; `shared` once belle2 is saturated for that shape; `kill-shared` last,
+when the non-kill wait exceeds the kill route's wait plus its expected
+preemption loss. Every input is measured: the three waits are the scheduler's
+own start estimates from `sbatch --test-only` (nothing is submitted), the
+preemption rate is your own past week on `kill-*`, and with a run time given
+the expected completion per route is printed with the verdict -- for a job
+that loses its whole elapsed time when preempted, or, with `--resumable`, one
+cell of it. A preempted job on `kill-shared` is requeued, so a job that
+checkpoints or skips finished pieces is the right tenant there; one that
+restarts from zero is not, and the numbers say when.
 
 The control sockets live under `~/.ssh/`: if your ssh config sets a
 `ControlPath` for the host, that one is used; otherwise
@@ -546,7 +568,8 @@ koa batch -p sandbox -t 0:10:00 -J hello --wrap 'hostname; module load data/ROOT
 koa watch 1234567
 koa q                                    # your jobs with their cores and memory
 koa job 1234567                          # everything Slurm knows about one job
-koa jobstats --family                    # your week: efficiency and memory headroom per job family
+koa jobstats --family                    # your week: efficiency, memory headroom, wait and preemptions per family
+koa route 1 72G 120                      # a 1-core 72 GB two-hour job: where would it start soonest, all told
 koa tail 1234567                         # ~/logs/hello-1234567.out
 koa kill 1234567                         # shows the job; nothing happens yet
 koa kill 1234567 --apply                 # now it is cancelled

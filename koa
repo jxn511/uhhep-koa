@@ -38,7 +38,15 @@
 #                             human-readable job statistics, past and current: per job
 #                             the cores, elapsed, CPU efficiency (CPU time used over
 #                             elapsed x cores), memory requested vs peak; --family folds
-#                             them per job-name family; running jobs live from sstat
+#                             them per job-name family, with the median submit-to-start
+#                             wait and the preempted / requeued count; running jobs live
+#   koa route <cpus> <mem> [<run minutes>] [--resumable [<cell minutes>]]
+#                             where to submit a job of this shape NOW: the scheduler's own
+#                             start estimate on belle2, shared and kill-shared (sbatch
+#                             --test-only), the measured kill-queue preemption rate, and
+#                             the expected completion time per route under the rule
+#                             "kill-shared only when the non-kill wait exceeds its wait
+#                             plus the expected preemption loss"
 #
 #   koa push <path> [dest]    tar + ship + VERIFY sha256 (Lustre-friendly)
 #   koa stage                 what is already staged on Koa, and free space
@@ -415,8 +423,21 @@ jobstats)
     kssh "$KOA_HOST" "U=$u SINCE=$since NAME=$name FAM=$fam RUNNING=$running bash -s" <<'REMOTE'
 case "$SINCE" in *d) S=$(date -u -d "${SINCE%d} days ago" +%Y-%m-%dT%H:%M);; *) S=$SINCE;; esac
 echo "== jobs of $U since $S UTC (sacct; EFF = the batch step's CPU time / (elapsed x allocated CPUs); PEAK = the step's MaxRSS) =="
-sacct -u "$U" -S "$S" -P -n ${NAME:+--name="$NAME"} -o JobID,JobName,Partition,AllocCPUS,ElapsedRaw,TotalCPU,ReqMem,MaxRSS,State 2>/dev/null \
-| awk -F'|' -v fam="$FAM" '
+# gawk's mktime turns Submit / Start into the wait; without gawk the wait column reads n/a
+if awk --version 2>/dev/null | grep -q GNU; then EP='function ep(t) { if (t == "" || t ~ /Unknown|None|N\/A/) return -1; gsub(/[-T:]/, " ", t); return mktime(t) }'
+else EP='function ep(t) { return -1 }'; fi
+# preempted / requeued incarnations and the kill-queue running hours, from the duplicate records (sacct -D), per family
+PRE=$(sacct -u "$U" -S "$S" -D -X -P -n ${NAME:+--name="$NAME"} -o JobName,Partition,State,ElapsedRaw 2>/dev/null \
+| awk -F'|' 'function family(n,  m) { m = n
+    while (1) {
+      if (m ~ /_[A-Za-z]*[0-9][A-Za-z0-9]*$/) { sub(/_[A-Za-z]*[0-9][A-Za-z0-9]*$/, "", m); continue }
+      if (m ~ /[0-9][A-Za-z0-9]*_[A-Za-z]+$/) { sub(/_[A-Za-z]+$/, "", m); continue }
+      break }
+    return (m == "") ? n : m }
+  { k = family($1); if ($3 ~ /^(PREEMPTED|REQUEUED)/) { pre[k]++; tot++ }; if ($2 ~ /^kill-/) { kh += $4 / 3600.0; if ($3 ~ /^(PREEMPTED|REQUEUED)/) kpre++ } }
+  END { for (k in pre) printf "%s %d\n", k, pre[k]; printf "__TOTAL__ %d %.2f %d\n", tot, kh, kpre }')
+sacct -u "$U" -S "$S" -P -n ${NAME:+--name="$NAME"} -o JobID,JobName,Partition,AllocCPUS,ElapsedRaw,TotalCPU,ReqMem,MaxRSS,State,Submit,Start 2>/dev/null \
+| awk -F'|' -v fam="$FAM" -v pre="$PRE" "$EP"'
   function secs(t,  n, a, d) { d = 0; if (t ~ /-/) { split(t, a, "-"); d = a[1]; t = a[2] } n = split(t, a, ":"); if (n == 3) return d*86400 + a[1]*3600 + a[2]*60 + a[3]; if (n == 2) return a[1]*60 + a[2]; return t + 0 }
   function gb(s,  v, u) { if (s == "") return 0; v = s + 0; u = substr(s, length(s)); if (u == "K") return v/1048576; if (u == "M") return v/1024; if (u == "G") return v; if (u == "T") return v*1024; return v/1073741824 }
   function hm(e) { return sprintf("%d:%02d", int(e/3600), int((e%3600)/60)) }
@@ -427,9 +448,14 @@ sacct -u "$U" -S "$S" -P -n ${NAME:+--name="$NAME"} -o JobID,JobName,Partition,A
       break }
     return (m == "") ? n : m }
   $1 ~ /\.(batch|extern|[0-9]+)$/ { b = $1; sub(/\.[^.]*$/, "", b); cpu[b] += secs($6); r = gb($8); if (r > rss[b]) rss[b] = r; next }
-  { n++; id[n] = $1; name[n] = $2; part[n] = $3; ncpu[n] = $4 + 0; el[n] = $5 + 0; req[n] = $7; st[n] = $9; sub(/ .*/, "", st[n]) }
+  { n++; id[n] = $1; name[n] = $2; part[n] = $3; ncpu[n] = $4 + 0; el[n] = $5 + 0; req[n] = $7; st[n] = $9; sub(/ .*/, "", st[n])
+    w = -1; if (ep($10) > 0 && ep($11) > 0) w = (ep($11) - ep($10)) / 60.0; wait[n] = w }
+  function median(arr, m,  i, tmp, j, t) { if (m == 0) return -1; for (i = 1; i <= m; i++) tmp[i] = arr[i]
+    for (i = 2; i <= m; i++) { t = tmp[i]; for (j = i - 1; j >= 1 && tmp[j] > t; j--) tmp[j + 1] = tmp[j]; tmp[j + 1] = t }
+    return (m % 2) ? tmp[(m + 1) / 2] : (tmp[m / 2] + tmp[m / 2 + 1]) / 2 }
   END {
     if (n == 0) { print "  (no jobs in the window)"; exit }
+    split(pre, prelines, "\n"); for (i in prelines) { split(prelines[i], pp, " "); if (pp[1] == "__TOTAL__") { ptot = pp[2]; kh = pp[3]; kpre = pp[4] } else fpre[pp[1]] = pp[2] }
     ta = 0; tu = 0; live = 0
     if (!fam) printf "%-13s %-22s %-11s %4s %7s %5s %8s %8s %s\n", "JOBID", "NAME", "PARTITION", "CPUS", "ELAPSED", "EFF", "REQMEM", "PEAK", "STATE"
     for (i = 1; i <= n; i++) {
@@ -439,6 +465,7 @@ sacct -u "$U" -S "$S" -P -n ${NAME:+--name="$NAME"} -o JobID,JobName,Partition,A
         ta += alloc; tu += used
         fn[k]++; fa[k] += alloc; fu[k] += used; fr[k] = req[i]
         if (!(k in fmin) || ncpu[i] < fmin[k]) fmin[k] = ncpu[i]; if (ncpu[i] > fmax[k]) fmax[k] = ncpu[i]; if (rss[id[i]] > fp[k]) fp[k] = rss[id[i]]
+        if (wait[i] >= 0) { fw[k, ++fwn[k]] = wait[i] }
       }
       if (!fam) {
         flag = ""
@@ -448,13 +475,17 @@ sacct -u "$U" -S "$S" -P -n ${NAME:+--name="$NAME"} -o JobID,JobName,Partition,A
       }
     }
     if (fam) {
-      printf "%-24s %5s %10s %9s %5s %-8s %8s %7s\n", "FAMILY", "JOBS", "ALLOC-CPUh", "USED-CPUh", "EFF", "CPUS", "REQMEM", "PEAK"
+      printf "%-24s %5s %10s %9s %5s %-8s %8s %7s %8s %7s\n", "FAMILY", "JOBS", "ALLOC-CPUh", "USED-CPUh", "EFF", "CPUS", "REQMEM", "PEAK", "WAIT-p50", "PREEMPT"
       for (k in fn) { e = (fa[k] > 0) ? 100 * fu[k] / fa[k] : 0; cc = (fmin[k] == fmax[k]) ? fmin[k] "" : fmin[k] "-" fmax[k]
-        printf "%-24s %5d %10.1f %9.1f %4.0f%% %-8s %8s %6.1fG\n", substr(k, 1, 24), fn[k], fa[k]/3600, fu[k]/3600, e, cc, fr[k], fp[k] }
+        m = fwn[k] + 0; for (q = 1; q <= m; q++) tmpw[q] = fw[k, q]; md = median(tmpw, m)
+        printf "%-24s %5d %10.1f %9.1f %4.0f%% %-8s %8s %6.1fG %8s %7d\n", substr(k, 1, 24), fn[k], fa[k]/3600, fu[k]/3600, e, cc, fr[k], fp[k], (md < 0 ? "n/a" : sprintf("%.0fm", md)), fpre[k] + 0 }
     }
     printf "\n%d jobs in the window (%d running or pending); the finished ones: %.1f CPU-hours allocated, %.1f used, %.0f%% efficiency (the facility target is 90%%)\n", n, live, ta/3600, tu/3600, (ta > 0 ? 100*tu/ta : 0)
+    if (kh > 0) printf "kill-queue preemptions: %d over %.1f running hours on kill-* = %.3f per running hour (the route rule'"'"'s lambda); %d preempted / requeued incarnations in all\n", kpre, kh, kpre / kh, ptot
+    else printf "kill-queue preemptions: no kill-* running hours in the window; %d preempted / requeued incarnations in all\n", ptot
     print "reading it: EFF near 100% / CPUS is one process on several cores -> --cpus-per-task=1 (or a worker pool sized to the cores);"
-    print "  PEAK far below REQMEM is memory nobody else could use -> --mem to the measured peak with a margin."
+    print "  PEAK far below REQMEM is memory nobody else could use -> --mem to the measured peak with a margin;"
+    print "  WAIT-p50 is the family'"'"'s median submit-to-start wait, PREEMPT its preempted / requeued incarnations (koa route uses both)."
   }'
 if [ "$RUNNING" = 1 ]; then
   echo
@@ -475,6 +506,73 @@ if [ "$RUNNING" = 1 ]; then
   done <<< "$(squeue -u "$U" -h -t R -o '%i %j %P %C %M %m' ${NAME:+--name="$NAME"})"
   [ "$nrun" -gt 0 ] || echo "  (nothing running)"
 fi
+REMOTE
+    ;;
+
+route)
+    # Where to submit a job of this shape NOW, under the facility-use rule accepted 2026-10-18: belle2 (the group's own node)
+    # first; shared once belle2 is saturated for the job's shape; kill-shared last, when the non-kill wait exceeds the kill
+    # route's wait plus its expected preemption loss. The inputs are measured, not guessed: the scheduler's own start estimate
+    # per route (sbatch --test-only submits nothing), and the kill-queue preemption rate over the past 7 days of your own
+    # accounting (sacct -D: preempted or requeued incarnations per running hour on kill-*). Forms:
+    #   koa route <cpus> <mem>                       the three waits and the rate
+    #   koa route <cpus> <mem> <run minutes>         + the expected completion per route and the verdict, for a job that
+    #                                                loses its whole elapsed time when preempted
+    #   koa route <cpus> <mem> <run minutes> --resumable [<cell minutes>]
+    #                                                for a job that resumes and loses one cell (default 10 min) per preemption
+    [ $# -ge 2 ] || die "usage: koa route <cpus> <mem> [<run minutes>] [--resumable [<cell minutes>]]"
+    cpus="$1"; mem="$2"; shift 2; run=""; cell=""; resumable=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --resumable) resumable=1; case "${2-}" in [0-9]*) cell="$2"; shift;; esac;;
+            [0-9]*) run="$1";;
+            -h|--help) die "usage: koa route <cpus> <mem> [<run minutes>] [--resumable [<cell minutes>]]";;
+            *) die "route: unknown argument $1";;
+        esac
+        shift
+    done
+    case "$cpus" in ''|*[!0-9]*) die "route: cpus '$cpus' is not a count";; esac
+    case "$mem" in ''|*[!0-9GMgm]*) die "route: mem '$mem' is not a Slurm memory (e.g. 12G, 96G)";; esac
+    case "$run$cell" in *[!0-9]*) die "route: minutes must be counts";; esac
+    [ "$resumable" = 1 ] && [ -z "$cell" ] && cell=10
+    need_socket
+    kssh "$KOA_HOST" "CPUS=$cpus MEM=$mem RUN=$run CELL=$cell RESUMABLE=$resumable bash -s" <<'REMOTE'
+now=$(date -u +%s)
+tl=$(( ${RUN:-60} + 5 ))
+est() {  # <partition> <account> -> minutes until the scheduler's estimated start, or a word
+    local out t
+    out=$(sbatch --test-only -p "$1" -A "$2" --nodes=1 --ntasks=1 --cpus-per-task="$CPUS" --mem="$MEM" -t "$tl" --wrap=true 2>&1)
+    t=$(printf '%s' "$out" | grep -oE 'to start at [0-9T:-]+' | head -1 | awk '{print $4}')
+    if [ -n "$t" ]; then echo $(( ($(date -u -d "$t" +%s) - now) / 60 )); else printf '%s' "$out" | tr '\n' ' ' | cut -c1-90; fi
+}
+w_b=$(est belle2 belle2); w_s=$(est shared uh); w_k=$(est kill-shared uh)
+S=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M)
+read -r kpre kh < <(sacct -u "$USER" -S "$S" -D -X -P -n -o Partition,State,ElapsedRaw 2>/dev/null | awk -F'|' '$1 ~ /^kill-/ { h += $3/3600.0; if ($2 ~ /^(PREEMPTED|REQUEUED)/) p++ } END { printf "%d %.2f\n", p + 0, h + 0 }')
+lam=$(awk -v p="$kpre" -v h="$kh" 'BEGIN { if (h > 0) printf "%.4f", p / h; else print "n/a" }')
+echo "== koa route: a ${CPUS}-CPU ${MEM} job, now $(date -u +%Y-%m-%dT%H:%M)Z =="
+printf "%-12s %s\n" "route" "scheduler start estimate (sbatch --test-only; minutes from now, or why none)"
+printf "%-12s %s\n" "belle2" "$w_b"
+printf "%-12s %s\n" "shared" "$w_s"
+printf "%-12s %s\n" "kill-shared" "$w_k"
+if [ "$lam" = "n/a" ]; then echo "kill-queue preemption rate: no kill-* running hours in your past 7 days (lambda unknown; 0 assumed below)"; lam=0
+else echo "kill-queue preemption rate: $kpre preempted / requeued over $kh running hours on kill-* = $lam per running hour"; fi
+[ -n "$RUN" ] || { echo "(give the run time in minutes for the expected completion per route and the verdict)"; exit 0; }
+num() { case "$1" in ''|*[!0-9-]*) echo ""; ;; *) echo "$1";; esac; }
+nb=$(num "$w_b"); ns=$(num "$w_s"); nk=$(num "$w_k")
+c=$([ "$RESUMABLE" = 1 ] && echo "$CELL" || echo "$RUN")
+loss=$(awk -v l="$lam" -v r="$RUN" -v c="$c" 'BEGIN { printf "%.1f", l * r / 60.0 * c }')
+echo
+echo "expected completion (minutes): wait + run time, the kill route plus its preemption loss lambda x run/60 x loss-per-preemption"
+echo "  loss per preemption: $c min ($([ "$RESUMABLE" = 1 ] && echo "resumable: one cell" || echo "whole product: the run time")); expected loss on kill-shared: $loss min"
+Eb=$([ -n "$nb" ] && echo $(( nb + RUN )) || echo n/a); Es=$([ -n "$ns" ] && echo $(( ns + RUN )) || echo n/a)
+Ek=$([ -n "$nk" ] && awk -v w="$nk" -v r="$RUN" -v l="$loss" 'BEGIN { printf "%.0f", w + r + l }' || echo n/a)
+printf "  %-12s %s\n" belle2 "$Eb"; printf "  %-12s %s\n" shared "$Es"; printf "  %-12s %s\n" kill-shared "$Ek"
+echo
+if [ -n "$nb" ] && [ "$nb" -le "$RUN" ]; then echo "VERDICT: belle2 -- its wait ($nb min) is within the run time; the resource of first instance is not saturated for this shape"
+elif [ -n "$ns" ] && { [ -z "$nk" ] || awk -v s="$ns" -v k="$nk" -v l="$loss" 'BEGIN { exit !(s <= k + l) }'; }; then echo "VERDICT: shared -- belle2 is saturated for this shape (wait ${nb:-unknown} min > run time), and shared's wait ($ns min) does not exceed kill-shared's wait plus its expected loss (${nk:-?} + $loss min)"
+elif [ -n "$nk" ]; then echo "VERDICT: kill-shared -- the last instance: belle2 saturated (wait ${nb:-unknown} min), shared's wait (${ns:-unknown} min) exceeds kill-shared's ($nk min) plus the expected preemption loss ($loss min)"
+else echo "VERDICT: none measurable -- the scheduler gave no start estimate on any route (see the messages above)"; fi
+echo "(a ladder submission -- belle2 now, a shared duplicate past t1, a kill-shared duplicate past t2, the first to start wins -- needs no verdict; the clone's scripts/koa/ladder_*.sh do that)"
 REMOTE
     ;;
 
