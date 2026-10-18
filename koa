@@ -35,6 +35,7 @@
 #                             run) unless --apply; a whole array by its base id,
 #                             one task as <id>_<task>; never another user's job
 #   koa jobstats [user] [--since 7d|<YYYY-MM-DD>] [--name <JobName>] [--family] [--no-running]
+#   koa cost <jobid>[,<jobid>...] [--name <JobName>] [--since 7d|<YYYY-MM-DD>] [--resumable]
 #                             human-readable job statistics, past and current: per job
 #                             the cores, elapsed, CPU efficiency (CPU time used over
 #                             elapsed x cores), memory requested vs peak; --family folds
@@ -382,6 +383,62 @@ kill)
     echo "koa: kill: $left of $n job line(s) still listed after scancel (completing, or scancel refused above)"; exit 1
     ;;
 
+cost)
+    # The sunk and remaining cost of jobs, COMPUTED from accounting (sacct), never by eye or by hand-arithmetic (2026-10-18:
+    # a hand-estimated figure in a cancellation decision was wrong by ~4x and mislabeled its units). Units are explicit:
+    # sunk CPU-hours = elapsed hours x allocated CPUs; sunk GB-hours = elapsed hours x requested GB. "Remaining" is the
+    # WALLTIME BOUND of a queued or running job (time limit minus elapsed) -- an upper bound, never a prediction.
+    # --resumable notes that a cancelled job's redo cost is bounded by one table write, not by its sunk time. Read-only.
+    #   koa cost <jobid>[,<jobid>...] [--name <JobName>] [--since 7d|<YYYY-MM-DD>] [--resumable]
+    name=""; since="7d"; resumable=0; ids=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)      name="${2-}"; [ -n "$name" ] || die "cost: --name needs a job name"; shift;;
+            --name=*)    name="${1#--name=}";;
+            --since)     since="${2-}"; [ -n "$since" ] || die "cost: --since needs 7d or a date"; shift;;
+            --since=*)   since="${1#--since=}";;
+            --resumable) resumable=1;;
+            -h|--help)   die "usage: koa cost <jobid>[,<jobid>...] [--name <JobName>] [--since 7d|<YYYY-MM-DD>] [--resumable]";;
+            -*)          die "cost: unknown option $1";;
+            *)  IFS=',' read -ra more <<< "$1"
+                for t in "${more[@]}"; do
+                    case "$t" in ''|*[!0-9_]*|_*|*_) die "cost: '$t' is not a Slurm job id (123 or 123_4)";; esac
+                    ids+=("$t")
+                done;;
+        esac
+        shift
+    done
+    [ ${#ids[@]} -gt 0 ] || [ -n "$name" ] || die "usage: koa cost <jobid>[,<jobid>...] [--name <JobName>] [--since 7d|<YYYY-MM-DD>] [--resumable]"
+    case "$name" in *[!A-Za-z0-9_.+-]*) die "cost: --name '$name' has characters a Slurm job name does not";; esac
+    case "$since" in *d) S=$(date -u -d "${since%d} days ago" +%Y-%m-%dT%H:%M);; *) S=$since;; esac
+    need_socket
+    sel="sacct -u $KOA_USER -S $S -X -P -n -o JobID,JobName,Partition,State,AllocCPUS,ReqMem,ElapsedRaw,TimelimitRaw"
+    [ -n "$name" ] && sel="$sel --name=$name"
+    [ ${#ids[@]} -gt 0 ] && sel="$sel -j $(IFS=,; printf '%s' "${ids[*]}")"
+    kssh "$KOA_HOST" "$sel" 2>/dev/null | tr -d '\r' | awk -F'|' -v res="$resumable" '
+    function gbof(m,  v, u) { sub(/[nc]$/, "", m); v = m + 0; u = substr(m, length(m), 1)
+        if (u == "G") return v; if (u == "M") return v / 1024; if (u == "K") return v / 1048576; if (u == "T") return v * 1024; return v }
+    BEGIN { printf "%-14s %-24s %-11s %-10s %4s %7s %8s  %10s %10s %11s\n", \
+                   "JOBID", "NAME", "PARTITION", "STATE", "CPUS", "REQ-GB", "ELAP-h", "SUNK-CPUh", "SUNK-GBh", "REMAIN-min" }
+    NF >= 8 {
+        eh = $7 / 3600.0; g = gbof($6); c = $5 + 0
+        sc = eh * c; sg = eh * g
+        rem = "0"
+        if ($4 ~ /^(RUNNING|PENDING)/) { if ($8 ~ /^[0-9]+$/) { r = $8 - $7 / 60.0; if (r < 0) r = 0; rem = sprintf("%.0f", r) } else rem = "?" }
+        printf "%-14s %-24s %-11s %-10s %4d %7.1f %8.2f  %10.2f %10.1f %11s\n", $1, substr($2, 1, 24), $3, substr($4, 1, 10), c, g, eh, sc, sg, rem
+        tc += sc; tg += sg
+        if (rem != "?") { rcpu += rem * c / 60.0; rgb += rem * g / 60.0 }
+        n++
+    }
+    END {
+        if (n == 0) { print "koa: cost: accounting lists no matching job in the window (widen --since?)"; exit 1 }
+        printf "\nTOTALS over %d job(s), units stated: SUNK %.2f CPU-hours and %.1f GB-hours (elapsed x allocation, sacct).\n", n, tc, tg
+        printf "REMAINING walltime bound of the queued / running ones: %.2f CPU-hours and %.1f GB-hours (limit minus elapsed; an upper bound, not a prediction).\n", rcpu, rgb
+        if (res == 1) print "Redo if cancelled now: the writers are RESUMABLE -- bounded by one table write, not by the sunk figures."
+        else          print "Redo if cancelled now (whole-product, not resumable): the sunk figures above would repeat."
+    }'
+    ;;
+
 jobstats)
     # Human-readable job statistics, past and current -- the quantities the
     # facility's efficiency notices are computed from, so you can read them
@@ -481,7 +538,11 @@ sacct -u "$U" -S "$S" -P -n ${NAME:+--name="$NAME"} -o JobID,JobName,Partition,A
         printf "%-24s %5d %10.1f %9.1f %4.0f%% %-8s %8s %6.1fG %8s %7d\n", substr(k, 1, 24), fn[k], fa[k]/3600, fu[k]/3600, e, cc, fr[k], fp[k], (md < 0 ? "n/a" : sprintf("%.0fm", md)), fpre[k] + 0 }
     }
     printf "\n%d jobs in the window (%d running or pending); the finished ones: %.1f CPU-hours allocated, %.1f used, %.0f%% efficiency (the facility target is 90%%)\n", n, live, ta/3600, tu/3600, (ta > 0 ? 100*tu/ta : 0)
-    if (kh > 0) printf "kill-queue preemptions: %d over %.1f running hours on kill-* = %.3f per running hour (the route rule'"'"'s lambda); %d preempted / requeued incarnations in all\n", kpre, kh, kpre / kh, ptot
+    if (kh > 0) {
+      plo = (kpre > 0) ? kpre * (1 - 1 / (9.0 * kpre) - 1 / (3.0 * sqrt(kpre)))^3 : 0
+      phi = kpre + sqrt(kpre + 0.75) + 1
+      printf "kill-queue preemptions: %d over %.1f running hours on kill-* = %.4f per running hour, 68%% interval [%.4f, %.4f] (Poisson, Gehrels, on %d events -- few counts: indicative, not precise; the route rule'"'"'s lambda); %d preempted / requeued incarnations in all\n", kpre, kh, kpre / kh, plo / kh, phi / kh, kpre, ptot
+    }
     else printf "kill-queue preemptions: no kill-* running hours in the window; %d preempted / requeued incarnations in all\n", ptot
     print "reading it: EFF near 100% / CPUS is one process on several cores -> --cpus-per-task=1 (or a worker pool sized to the cores);"
     print "  PEAK far below REQMEM is memory nobody else could use -> --mem to the measured peak with a margin;"
@@ -565,7 +626,11 @@ printf "%-12s %s\n" "" "belle2 now: $b2_cpu_free of $b2_cpu_tot CPUs and $(( b2_
 printf "%-12s %s\n" "shared" "$w_s"
 printf "%-12s %s\n" "kill-shared" "$w_k"
 if [ "$lam" = "n/a" ]; then echo "kill-queue preemption rate: no kill-* running hours in your past 7 days (lambda unknown; 0 assumed below)"; lam=0
-else echo "kill-queue preemption rate: $kpre preempted / requeued over $kh running hours on kill-* = $lam per running hour"; fi
+else
+    lam_lo=$(awk -v p="$kpre" -v h="$kh" 'BEGIN { if (p <= 0) { print "0.0000"; exit } printf "%.4f", p * (1 - 1 / (9.0 * p) - 1 / (3.0 * sqrt(p)))^3 / h }')
+    lam_hi=$(awk -v p="$kpre" -v h="$kh" 'BEGIN { printf "%.4f", (p + sqrt(p + 0.75) + 1) / h }')
+    echo "kill-queue preemption rate: $kpre preempted / requeued over $kh running hours on kill-* = $lam per running hour, 68% interval [$lam_lo, $lam_hi] (Poisson, Gehrels, on $kpre events: few counts, the point value is indicative)"
+fi
 [ -n "$RUN" ] || { echo "(give the run time in minutes for the expected completion per route and the verdict)"; exit 0; }
 num() { case "$1" in ''|*[!0-9-]*) echo ""; ;; *) echo "$1";; esac; }
 nb=$(num "$w_b"); ns=$(num "$w_s"); nk=$(num "$w_k")

@@ -494,6 +494,13 @@ koa jobstats [user] [--since 7d|<YYYY-MM-DD>] [--name <JobName>] [--family] [--n
                           the wasteful shapes flagged; --family folds them per job-name
                           family with the median wait and the preempted count; running
                           jobs live from sstat
+koa cost  <jobid>[,<jobid>...] [--name <JobName>] [--since 7d|<YYYY-MM-DD>] [--resumable]
+                          the sunk and remaining cost of jobs from accounting, units
+                          stated: sunk CPU-hours and GB-hours (elapsed x allocation),
+                          and the remaining WALLTIME BOUND of the queued or running
+                          ones (limit minus elapsed); --resumable notes the redo cost
+                          is one table write. Computed, never hand-arithmetic: a
+                          resource claim in a scheduling decision cites this output.
 koa route <cpus> <mem> [<run minutes>] [--resumable [<cell minutes>]]
                           where to submit a job of this shape now: the scheduler's start
                           estimate on belle2, shared and kill-shared, the measured kill-queue
