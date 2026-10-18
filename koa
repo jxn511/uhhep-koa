@@ -546,12 +546,22 @@ est() {  # <partition> <account> -> minutes until the scheduler's estimated star
     if [ -n "$t" ]; then echo $(( ($(date -u -d "$t" +%s) - now) / 60 )); else printf '%s' "$out" | tr '\n' ' ' | cut -c1-90; fi
 }
 w_b=$(est belle2 belle2); w_s=$(est shared uh); w_k=$(est kill-shared uh)
+# belle2 is the group's own node: what is free on it NOW and how much of its queue is the caller's own matter more than the
+# scheduler's estimate, which counts every pending job (the caller's own placeholder duplicates included) at its full time limit
+b2node=$(sinfo -p belle2 -N -h -o '%N' | head -1)
+read -r b2_cpu_alloc b2_cpu_tot b2_mem_alloc b2_mem_tot < <(scontrol show node "$b2node" 2>/dev/null | tr ' ' '\n' | awk -F= '/^CPUAlloc=/{a=$2} /^CPUTot=/{t=$2} /^AllocMem=/{m=$2} /^RealMemory=/{r=$2} END{print a+0, t+0, m+0, r+0}')
+b2_cpu_free=$(( b2_cpu_tot - b2_cpu_alloc )); b2_mem_free_mb=$(( b2_mem_tot - b2_mem_alloc ))
+mem_mb=$(awk -v m="$MEM" 'BEGIN { u = substr(m, length(m)); v = m + 0; if (u == "G" || u == "g") v *= 1024; printf "%d", v }')
+b2_mine_pd=$(squeue -u "$USER" -h -p belle2 -t PD -o '%i' 2>/dev/null | wc -l); b2_mine_r=$(squeue -u "$USER" -h -p belle2 -t R -o '%i' 2>/dev/null | wc -l)
+fits_now=0; [ "$b2_cpu_free" -ge "$CPUS" ] && [ "$b2_mem_free_mb" -ge "$mem_mb" ] && fits_now=1
 S=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M)
 read -r kpre kh < <(sacct -u "$USER" -S "$S" -D -X -P -n -o Partition,State,ElapsedRaw 2>/dev/null | awk -F'|' '$1 ~ /^kill-/ { h += $3/3600.0; if ($2 ~ /^(PREEMPTED|REQUEUED)/) p++ } END { printf "%d %.2f\n", p + 0, h + 0 }')
 lam=$(awk -v p="$kpre" -v h="$kh" 'BEGIN { if (h > 0) printf "%.4f", p / h; else print "n/a" }')
 echo "== koa route: a ${CPUS}-CPU ${MEM} job, now $(date -u +%Y-%m-%dT%H:%M)Z =="
 printf "%-12s %s\n" "route" "scheduler start estimate (sbatch --test-only; minutes from now, or why none)"
 printf "%-12s %s\n" "belle2" "$w_b"
+printf "%-12s %s\n" "" "belle2 now: $b2_cpu_free of $b2_cpu_tot CPUs and $(( b2_mem_free_mb / 1024 )) of $(( b2_mem_tot / 1024 )) GB free; your jobs there: $b2_mine_r running, $b2_mine_pd pending$([ "$fits_now" = 1 ] && echo ' -> this job FITS NOW' || echo '')"
+[ "$b2_mine_pd" -gt 0 ] && printf "%-12s %s\n" "" "(the estimate above queues this job behind your own $b2_mine_pd pending there, each at its full time limit; a pending copy that would exit at once -- a ladder duplicate -- inflates it: cancel those first, koa kill)"
 printf "%-12s %s\n" "shared" "$w_s"
 printf "%-12s %s\n" "kill-shared" "$w_k"
 if [ "$lam" = "n/a" ]; then echo "kill-queue preemption rate: no kill-* running hours in your past 7 days (lambda unknown; 0 assumed below)"; lam=0
@@ -568,7 +578,8 @@ Eb=$([ -n "$nb" ] && echo $(( nb + RUN )) || echo n/a); Es=$([ -n "$ns" ] && ech
 Ek=$([ -n "$nk" ] && awk -v w="$nk" -v r="$RUN" -v l="$loss" 'BEGIN { printf "%.0f", w + r + l }' || echo n/a)
 printf "  %-12s %s\n" belle2 "$Eb"; printf "  %-12s %s\n" shared "$Es"; printf "  %-12s %s\n" kill-shared "$Ek"
 echo
-if [ -n "$nb" ] && [ "$nb" -le "$RUN" ]; then echo "VERDICT: belle2 -- its wait ($nb min) is within the run time; the resource of first instance is not saturated for this shape"
+if [ "$fits_now" = 1 ]; then echo "VERDICT: belle2 -- the job fits the group's node NOW ($b2_cpu_free CPUs, $(( b2_mem_free_mb / 1024 )) GB free); the resource of first instance, whatever the estimate says about the queue behind your own pending jobs"
+elif [ -n "$nb" ] && [ "$nb" -le "$RUN" ]; then echo "VERDICT: belle2 -- its wait ($nb min) is within the run time; the resource of first instance is not saturated for this shape"
 elif [ -n "$ns" ] && { [ -z "$nk" ] || awk -v s="$ns" -v k="$nk" -v l="$loss" 'BEGIN { exit !(s <= k + l) }'; }; then echo "VERDICT: shared -- belle2 is saturated for this shape (wait ${nb:-unknown} min > run time), and shared's wait ($ns min) does not exceed kill-shared's wait plus its expected loss (${nk:-?} + $loss min)"
 elif [ -n "$nk" ]; then echo "VERDICT: kill-shared -- the last instance: belle2 saturated (wait ${nb:-unknown} min), shared's wait (${ns:-unknown} min) exceeds kill-shared's ($nk min) plus the expected preemption loss ($loss min)"
 else echo "VERDICT: none measurable -- the scheduler gave no start estimate on any route (see the messages above)"; fi

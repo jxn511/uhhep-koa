@@ -543,7 +543,11 @@ incarnations per running hour on `kill-*`, the quantity `koa route` needs.
 first; `shared` once belle2 is saturated for that shape; `kill-shared` last,
 when the non-kill wait exceeds the kill route's wait plus its expected
 preemption loss. Every input is measured: the three waits are the scheduler's
-own start estimates from `sbatch --test-only` (nothing is submitted), the
+own start estimates from `sbatch --test-only` (nothing is submitted), belle2's free
+cores and memory and your own running and pending jobs there are read directly
+(a job that fits the group's node now goes there whatever the estimate says: the
+estimate queues it behind your own pending jobs at their full time limits, and a
+pending duplicate that would exit at once inflates it -- cancel those first), the
 preemption rate is your own past week on `kill-*`, and with a run time given
 the expected completion per route is printed with the verdict -- for a job
 that loses its whole elapsed time when preempted, or, with `--resumable`, one
