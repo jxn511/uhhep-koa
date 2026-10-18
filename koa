@@ -34,6 +34,11 @@
 #                             cancel YOUR jobs: lists the matches and stops (a dry
 #                             run) unless --apply; a whole array by its base id,
 #                             one task as <id>_<task>; never another user's job
+#   koa jobstats [user] [--since 7d|<YYYY-MM-DD>] [--name <JobName>] [--family] [--no-running]
+#                             human-readable job statistics, past and current: per job
+#                             the cores, elapsed, CPU efficiency (CPU time used over
+#                             elapsed x cores), memory requested vs peak; --family folds
+#                             them per job-name family; running jobs live from sstat
 #
 #   koa push <path> [dest]    tar + ship + VERIFY sha256 (Lustre-friendly)
 #   koa stage                 what is already staged on Koa, and free space
@@ -367,6 +372,110 @@ kill)
     if [ -n "$sig" ]; then echo "koa: kill: signal $sig sent to $n job line(s); $left still listed (expected: a signal does not end the job)"; exit 0; fi
     if [ "$left" -eq 0 ]; then echo "koa: kill: cancelled $n job line(s); none left in the queue"; exit 0; fi
     echo "koa: kill: $left of $n job line(s) still listed after scancel (completing, or scancel refused above)"; exit 1
+    ;;
+
+jobstats)
+    # Human-readable job statistics, past and current -- the quantities the
+    # facility's efficiency notices are computed from, so you can read them
+    # before the sysadmins do. Past jobs from sacct: CPU efficiency is the
+    # batch step's TotalCPU over Elapsed x AllocCPUS (a job near 100 % / cores
+    # is one process on several cores); memory headroom is the step's MaxRSS
+    # against ReqMem. Running jobs live from sstat (CPU time so far, peak so
+    # far). Forms:
+    #   koa jobstats                       your own jobs, the past 7 days + running now
+    #   koa jobstats <user>                a colleague's (as `q`)
+    #   koa jobstats --since 30d | --since 2026-10-01
+    #   koa jobstats --name <JobName>      one job name
+    #   koa jobstats --family              one line per job-name family: the name
+    #                                      with its trailing _<suffix> tokens that
+    #                                      carry a digit removed (fit_chunk2, fit_v2
+    #                                      and fit_prompt16_offres fold to fit)
+    #   koa jobstats --no-running          the sacct table alone
+    u="$KOA_USER"; since="7d"; name=""; fam=0; running=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --since)      since="${2-}"; [ -n "$since" ] || die "jobstats: --since needs <N>d or YYYY-MM-DD"; shift;;
+            --since=*)    since="${1#--since=}";;
+            --name)       name="${2-}"; [ -n "$name" ] || die "jobstats: --name needs a job name"; shift;;
+            --name=*)     name="${1#--name=}";;
+            --family)     fam=1;;
+            --no-running) running=0;;
+            -h|--help)    die "usage: koa jobstats [user] [--since 7d|<YYYY-MM-DD>] [--name <JobName>] [--family] [--no-running]";;
+            -*)           die "jobstats: unknown option $1";;
+            *)            u="$1";;
+        esac
+        shift
+    done
+    valid_user "$u"
+    case "$since" in [0-9]*d|[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*) ;; *) die "jobstats: --since '$since' is neither <N>d nor YYYY-MM-DD";; esac
+    case "$since" in *[!0-9dT:-]*) die "jobstats: --since '$since' has characters a date does not";; esac
+    case "$name" in *[!A-Za-z0-9_.+-]*) die "jobstats: --name '$name' has characters a Slurm job name does not";; esac
+    need_socket
+    # the values above are validated against their character sets, so they can ride the remote command line
+    kssh "$KOA_HOST" "U=$u SINCE=$since NAME=$name FAM=$fam RUNNING=$running bash -s" <<'REMOTE'
+case "$SINCE" in *d) S=$(date -u -d "${SINCE%d} days ago" +%Y-%m-%dT%H:%M);; *) S=$SINCE;; esac
+echo "== jobs of $U since $S UTC (sacct; EFF = the batch step's CPU time / (elapsed x allocated CPUs); PEAK = the step's MaxRSS) =="
+sacct -u "$U" -S "$S" -P -n ${NAME:+--name="$NAME"} -o JobID,JobName,Partition,AllocCPUS,ElapsedRaw,TotalCPU,ReqMem,MaxRSS,State 2>/dev/null \
+| awk -F'|' -v fam="$FAM" '
+  function secs(t,  n, a, d) { d = 0; if (t ~ /-/) { split(t, a, "-"); d = a[1]; t = a[2] } n = split(t, a, ":"); if (n == 3) return d*86400 + a[1]*3600 + a[2]*60 + a[3]; if (n == 2) return a[1]*60 + a[2]; return t + 0 }
+  function gb(s,  v, u) { if (s == "") return 0; v = s + 0; u = substr(s, length(s)); if (u == "K") return v/1048576; if (u == "M") return v/1024; if (u == "G") return v; if (u == "T") return v*1024; return v/1073741824 }
+  function hm(e) { return sprintf("%d:%02d", int(e/3600), int((e%3600)/60)) }
+  function family(n,  m) { m = n
+    while (1) {
+      if (m ~ /_[A-Za-z]*[0-9][A-Za-z0-9]*$/) { sub(/_[A-Za-z]*[0-9][A-Za-z0-9]*$/, "", m); continue }
+      if (m ~ /[0-9][A-Za-z0-9]*_[A-Za-z]+$/) { sub(/_[A-Za-z]+$/, "", m); continue }
+      break }
+    return (m == "") ? n : m }
+  $1 ~ /\.(batch|extern|[0-9]+)$/ { b = $1; sub(/\.[^.]*$/, "", b); cpu[b] += secs($6); r = gb($8); if (r > rss[b]) rss[b] = r; next }
+  { n++; id[n] = $1; name[n] = $2; part[n] = $3; ncpu[n] = $4 + 0; el[n] = $5 + 0; req[n] = $7; st[n] = $9; sub(/ .*/, "", st[n]) }
+  END {
+    if (n == 0) { print "  (no jobs in the window)"; exit }
+    ta = 0; tu = 0; live = 0
+    if (!fam) printf "%-13s %-22s %-11s %4s %7s %5s %8s %8s %s\n", "JOBID", "NAME", "PARTITION", "CPUS", "ELAPSED", "EFF", "REQMEM", "PEAK", "STATE"
+    for (i = 1; i <= n; i++) {
+      alloc = el[i] * ncpu[i]; used = cpu[id[i]]; eff = (alloc > 0) ? 100 * used / alloc : 0
+      k = family(name[i])
+      if (st[i] == "RUNNING" || st[i] == "PENDING") { live++ } else {
+        ta += alloc; tu += used
+        fn[k]++; fa[k] += alloc; fu[k] += used; fr[k] = req[i]
+        if (!(k in fmin) || ncpu[i] < fmin[k]) fmin[k] = ncpu[i]; if (ncpu[i] > fmax[k]) fmax[k] = ncpu[i]; if (rss[id[i]] > fp[k]) fp[k] = rss[id[i]]
+      }
+      if (!fam) {
+        flag = ""
+        if (st[i] == "RUNNING") flag = "  (live: see below)"; else if (st[i] == "PENDING") flag = ""
+        else if (ncpu[i] > 1 && eff > 0 && eff < 150 / ncpu[i]) flag = "  <- one busy core of " ncpu[i]
+        printf "%-13s %-22s %-11s %4d %7s %4.0f%% %8s %7.1fG %s%s\n", id[i], substr(name[i], 1, 22), part[i], ncpu[i], hm(el[i]), eff, req[i], rss[id[i]], st[i], flag
+      }
+    }
+    if (fam) {
+      printf "%-24s %5s %10s %9s %5s %-8s %8s %7s\n", "FAMILY", "JOBS", "ALLOC-CPUh", "USED-CPUh", "EFF", "CPUS", "REQMEM", "PEAK"
+      for (k in fn) { e = (fa[k] > 0) ? 100 * fu[k] / fa[k] : 0; cc = (fmin[k] == fmax[k]) ? fmin[k] "" : fmin[k] "-" fmax[k]
+        printf "%-24s %5d %10.1f %9.1f %4.0f%% %-8s %8s %6.1fG\n", substr(k, 1, 24), fn[k], fa[k]/3600, fu[k]/3600, e, cc, fr[k], fp[k] }
+    }
+    printf "\n%d jobs in the window (%d running or pending); the finished ones: %.1f CPU-hours allocated, %.1f used, %.0f%% efficiency (the facility target is 90%%)\n", n, live, ta/3600, tu/3600, (ta > 0 ? 100*tu/ta : 0)
+    print "reading it: EFF near 100% / CPUS is one process on several cores -> --cpus-per-task=1 (or a worker pool sized to the cores);"
+    print "  PEAK far below REQMEM is memory nobody else could use -> --mem to the measured peak with a margin."
+  }'
+if [ "$RUNNING" = 1 ]; then
+  echo
+  echo "== running now (sstat, live: CPU time so far / (elapsed x CPUs); PEAK so far) =="
+  printf "%-13s %-22s %-11s %4s %9s %5s %8s %8s\n" JOBID NAME PARTITION CPUS ELAPSED EFF REQMEM PEAK
+  nrun=0
+  while read -r id nm part cpus el mem; do
+    [ -n "$id" ] || continue; nrun=$((nrun + 1))
+    s=$(sstat -j "${id}.batch" -P -n -o TRESUsageInTot,MaxRSS 2>/dev/null | head -1)
+    c=$(printf '%s' "$s" | grep -oE 'cpu=[0-9:-]+' | head -1 | cut -d= -f2)
+    r=$(printf '%s' "$s" | awk -F'|' '{print $2}')
+    awk -v id="$id" -v nm="$nm" -v part="$part" -v cpus="$cpus" -v el="$el" -v mem="$mem" -v c="$c" -v r="$r" '
+      function secs(t,  n, a, d) { d = 0; if (t ~ /-/) { split(t, a, "-"); d = a[1]; t = a[2] } n = split(t, a, ":"); if (n == 3) return d*86400 + a[1]*3600 + a[2]*60 + a[3]; if (n == 2) return a[1]*60 + a[2]; return t + 0 }
+      function gb(s,  v, u) { if (s == "") return 0; v = s + 0; u = substr(s, length(s)); if (u == "K") return v/1048576; if (u == "M") return v/1024; if (u == "G") return v; if (u == "T") return v*1024; return v/1073741824 }
+      BEGIN { e = secs(el); eff = (e * cpus > 0 && c != "") ? 100 * secs(c) / (e * cpus) : 0
+              flag = (c == "") ? "  (sstat: no data yet, or not your job)" : ((cpus > 1 && eff > 0 && eff < 150 / cpus) ? "  <- one busy core of " cpus : "")
+              printf "%-13s %-22s %-11s %4d %9s %4.0f%% %8s %7.1fG%s\n", id, substr(nm, 1, 22), part, cpus, el, eff, mem, gb(r), flag }'
+  done <<< "$(squeue -u "$U" -h -t R -o '%i %j %P %C %M %m' ${NAME:+--name="$NAME"})"
+  [ "$nrun" -gt 0 ] || echo "  (nothing running)"
+fi
+REMOTE
     ;;
 
 push)

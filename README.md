@@ -488,6 +488,11 @@ koa kill  <jobid>[,<jobid>...] [--name <JobName>] [--state <STATE>] [--signal <S
                           cancel YOUR jobs: lists the matching queue entries and stops
                           there (a dry run) unless --apply; a whole array by its base id,
                           one task as <id>_<task>; never another user's job
+koa jobstats [user] [--since 7d|<YYYY-MM-DD>] [--name <JobName>] [--family] [--no-running]
+                          human-readable job statistics, past and current: per job the
+                          cores, elapsed, CPU efficiency, memory requested vs peak, with
+                          the wasteful shapes flagged; --family folds them per job-name
+                          family; running jobs live from sstat
 
 koa push <path> [dest]    tar + ship via the DTN + verify sha256 on the far end;
                           default dest $KOA_SCRATCH/incoming
@@ -508,6 +513,22 @@ signal was sent with `--signal`), 1 when entries remain or nothing matched,
 carries `-u $KOA_USER`, so a colleague's job cannot be cancelled by a mistyped
 id; cancelling someone else's job is not a thing this tool does.
 
+`koa jobstats` prints what the facility's efficiency notices are computed
+from, so you can read your own numbers first. For every job of the window
+(the past 7 days by default; `--since 30d` or `--since 2026-10-01`) it shows
+the allocated cores, the elapsed time, the CPU efficiency -- the batch step's
+CPU time divided by elapsed x cores, from `sacct` -- and the memory requested
+against the peak actually used; a job whose efficiency sits near 100 % / cores
+is one process on several cores and is flagged as such (the fix is
+`--cpus-per-task=1`, or a worker pool sized to the cores), and a peak far
+below the request is memory nobody else could use. `--family` folds the table
+into one line per job-name family (the name with its trailing `_<suffix>`
+tokens that carry a digit removed, so `fit_chunk2`, `fit_v2` and
+`fit_prompt16_offres` fold to `fit`), with CPU-hours allocated and used per
+family -- the same figures, by family, that the weekly efficiency mail
+reports for the account. Running jobs are listed live from `sstat` (CPU time
+and peak so far). `koa jobstats <user>` reads a colleague's, as `q` does.
+
 The control sockets live under `~/.ssh/`: if your ssh config sets a
 `ControlPath` for the host, that one is used; otherwise
 `~/.ssh/cm-<host>`, i.e. `~/.ssh/cm-koa.its.hawaii.edu` and
@@ -525,6 +546,7 @@ koa batch -p sandbox -t 0:10:00 -J hello --wrap 'hostname; module load data/ROOT
 koa watch 1234567
 koa q                                    # your jobs with their cores and memory
 koa job 1234567                          # everything Slurm knows about one job
+koa jobstats --family                    # your week: efficiency and memory headroom per job family
 koa tail 1234567                         # ~/logs/hello-1234567.out
 koa kill 1234567                         # shows the job; nothing happens yet
 koa kill 1234567 --apply                 # now it is cancelled
